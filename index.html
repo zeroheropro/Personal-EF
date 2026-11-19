@@ -207,8 +207,6 @@
   table.compact .symtxt small { display: none; }
   table.compact .logo { width: 20px; height: 20px; font-size: 8px; }
   table.compact td .f-price { font-size: 14px; padding: 0 4px; }
-  table.compact td .f-pct, table.compact td .f-chg { display: inline; font-size: 13px; }
-  table.compact td .f-chg { margin-left: 6px; }
   table.compact .op { font-size: 12px; gap: 0 6px; }
   table.compact td canvas { height: 18px !important; }
   table.compact .w52 .bar { margin: 2px 0; }
@@ -258,6 +256,14 @@
   .menu a:hover { background: var(--panel2); }
   .menu a small { display: block; color: var(--muted); font-size: 12px; }
   .menu p { font-size: 11px; color: var(--muted); margin: 6px 10px 4px; line-height: 1.4; }
+  /* menus are placed by JS (fixed, clamped to the screen) so they never open off-screen */
+  .menu.placed { position: fixed; right: auto; max-width: calc(100vw - 16px); max-height: calc(100vh - 80px); overflow-y: auto; }
+  /* compact rows: keep % and $ stacked, just smaller */
+  table.compact td .f-pct { font-size: 12px; line-height: 1.15; }
+  table.compact td .f-chg { font-size: 11px; line-height: 1.15; }
+  @media (max-width: 600px) {
+    header { padding: 10px 12px; }
+  }
 </style>
 </head>
 <body>
@@ -269,10 +275,12 @@
   <div class="menuwrap"><button id="secBtn" title="Show or hide sections">☰ Sections</button><div class="menu" id="secMenu"></div></div>
   <button id="tvBtn" title="Show or hide live business TV">📺 Live TV</button>
   <button id="themeBtn" title="Switch light / dark theme">☀</button>
-  <button id="exportBtn" title="Save your lists, holdings, alerts and market boxes to a file">Export</button>
-  <button id="importBtn" title="Load a file you exported">Import</button>
+  <div class="menuwrap"><button id="gearBtn" title="Settings">⚙</button><div class="menu" id="gearMenu">
+    <a id="keyBtn">API key<small>Connect or change your Finnhub key</small></a>
+    <a id="exportBtn">Export<small>Save your lists, holdings, alerts and market boxes to a file</small></a>
+    <a id="importBtn">Import<small>Load a file you exported (replaces current data)</small></a>
+  </div></div>
   <input type="file" id="importFile" accept=".json,application/json" style="display:none">
-  <button id="keyBtn">API key</button>
 </header>
 <div id="alertBar"></div>
 
@@ -336,7 +344,7 @@
           <th data-sort="pos52" class="c-52">52-week</th>
           <th data-sort="pe" class="c-pe">P/E</th><th data-sort="mcap" class="c-mcap">Mkt cap</th>
           <th data-sort="dy" class="c-dy">Div yield</th><th data-sort="beta" class="c-beta">Beta</th>
-          <th class="c-trend">Trend</th><th></th>
+          <th class="c-trend" title="Price moves since you opened this page (not a full-day chart)">Session</th><th></th>
         </tr></thead>
         <tbody id="rows"></tbody>
       </table>
@@ -451,8 +459,8 @@ const DEFAULT_MARKETS = [
   { sym: 'SPY',      name: 'S&P 500',      note: 'SPY ETF' },
   { sym: 'QQQ',      name: 'Nasdaq 100',   note: 'QQQ ETF' },
   { sym: 'IWM',      name: 'Russell 2000', note: 'IWM ETF' },
-  { sym: 'VIXY',     name: 'VIX',          note: 'VIXY ETF' },
-  { sym: 'USO',      name: 'Crude Oil',    note: 'USO ETF' },
+  { sym: 'VIXY',     name: 'VIX futures',  note: 'VIXY ETF' },
+  { sym: 'USO',      name: 'Oil futures',  note: 'USO ETF' },
   { sym: 'PAXG-USD', name: 'Gold',         note: 'per oz', crypto: true },
   { sym: 'BTC-USD',  name: 'Bitcoin',      note: 'Coinbase', crypto: true },
 ];
@@ -473,8 +481,28 @@ const DEFAULT_TV = [
 
 const store = {
   get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch { return d; } },
-  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} }
+  set(k, v) {
+    const s = JSON.stringify(v);
+    try { localStorage.setItem(k, s); return true; } catch {}
+    // storage full: drop the re-downloadable caches and try once more, so your own data still saves
+    pruneCaches(() => true);
+    try { localStorage.setItem(k, s); return true; } catch {}
+    if (!CACHE_RE.test(k)) setTimeout(() => toast("Couldn't save: this browser's storage is full. Use ⚙ > Export to back up your data.", 6000));
+    return false;
+  }
 };
+const CACHE_RE = /^fh_(prof|met2|rec|peer)_/;
+// remove cached company data; `drop(key, parsedValue)` decides which entries go
+function pruneCaches(drop) {
+  try {
+    for (let i = localStorage.length - 1; i >= 0; i--) {
+      const k = localStorage.key(i);
+      if (!k || !CACHE_RE.test(k)) continue;
+      let v = null; try { v = JSON.parse(localStorage.getItem(k)); } catch {}
+      if (drop(k, v)) localStorage.removeItem(k);
+    }
+  } catch {}
+}
 const uid = () => Math.random().toString(36).slice(2, 10);
 
 // ---- validation for anything loaded from storage or an imported file ----
@@ -532,6 +560,22 @@ function cleanTv(v) {
 
 let apiKey   = store.get('fh_key', '');
 let markets  = cleanMarkets(store.get('fh_markets', null)) || DEFAULT_MARKETS;
+// older versions labeled these ETFs as if they were the index / spot price
+markets.forEach(m => {
+  if (m.sym === 'VIXY' && m.name === 'VIX') m.name = 'VIX futures';
+  if (m.sym === 'USO' && m.name === 'Crude Oil') m.name = 'Oil futures';
+});
+// what a proxy box really tracks (shown on hover)
+const PROXY_NOTE = {
+  DIA: 'DIA ETF: moves with the Dow, priced at about 1/100 of the index',
+  SPY: 'SPY ETF: moves with the S&P 500, priced at about 1/10 of the index',
+  QQQ: 'QQQ ETF: tracks the Nasdaq 100',
+  IWM: 'IWM ETF: tracks the Russell 2000',
+  VIXY: 'VIXY holds short-term VIX futures. Its daily % moves are usually smaller than the VIX index and it loses value over time, so it is not the VIX level',
+  USO: 'USO holds oil futures, so it can drift from the spot crude price over time',
+  'PAXG-USD': 'PAX Gold token on Coinbase, backed 1:1 by an ounce of gold. Tracks spot gold closely, 24/7',
+  'BTC-USD': 'Bitcoin on Coinbase. Change is over the last 24 hours',
+};
 let lists    = cleanLists(store.get('fh_lists', null));
 if (!Array.isArray(lists) || !lists.length) {
   lists = [{ id: uid(), name: 'My Watchlist', symbols: (store.get('fh_watch', ['AAPL', 'MSFT', 'NVDA']) || []).map(cleanSym).filter(Boolean) }];
@@ -545,7 +589,7 @@ let collapsed = store.get('fh_collapsed', {});   // hidden sections
 const COLS = [
   { k: 'op', label: 'Open / Prev close', def: true }, { k: 'perf', label: 'Performance (5D…1Y)', def: true },
   { k: '52', label: '52-week range', def: true }, { k: 'pe', label: 'P/E', def: false }, { k: 'mcap', label: 'Market cap', def: false },
-  { k: 'dy', label: 'Dividend yield', def: false }, { k: 'beta', label: 'Beta', def: false }, { k: 'trend', label: 'Trend', def: true },
+  { k: 'dy', label: 'Dividend yield', def: false }, { k: 'beta', label: 'Beta', def: false }, { k: 'trend', label: 'Session trend (since page opened)', def: true },
 ];
 let cols = Object.assign(Object.fromEntries(COLS.map(c => [c.k, c.def])), { tint: true },
   store.get('fh_hide52', false) ? { '52': false } : {}, store.get('fh_cols', {}));
@@ -629,6 +673,7 @@ async function rawApi(path) {
   try { r = await fetch(`https://finnhub.io/api/v1/${path}${sep}token=${encodeURIComponent(apiKey)}`); }
   catch { throw new Error("Can't reach Finnhub. Open this file in Chrome/Edge/Safari (not the Claude preview), and check VPN/firewall"); }
   if (r.status === 429) { const e = new Error('Rate limited'); e.rate = true; throw e; }
+  if (r.status === 401) { keyBad = true; stopStream(); }
   if (r.status === 401) throw new Error('Finnhub says the API key is invalid. Re-copy it from your Finnhub dashboard');
   if (r.status === 403) throw new Error('Finnhub denied access (403). This data may not be on the free plan');
   return r.json();
@@ -758,20 +803,27 @@ async function loadCryptoStats(id) {
 // ======================================================================
 // Live streams: Finnhub (stocks/ETFs) and Coinbase (crypto, no key)
 // ======================================================================
-let ws = null, reconnectTimer = null;
+let ws = null, reconnectTimer = null, keyBad = false, wsFails = 0;
 const subscribed = new Set();
+const WS_MAX = 50;          // Finnhub free plan streams at most 50 symbols; the rest are refreshed every minute
+const WS_MAX_FAILS = 6;     // after this many failed connects in a row, stop retrying and rely on the 1-minute refresh
+const streamLive = () => !!(ws && ws.readyState === 1);
+function stopStream() {
+  clearTimeout(reconnectTimer);
+  if (ws) { ws.onclose = null; ws.onerror = null; try { ws.close(); } catch {} ws = null; }
+  subscribed.clear();
+}
 function setStatus(state, text) {
   $('dot').className = 'dot' + (state === 'on' ? ' on' : state === 'err' ? ' err' : '');
   $('statusText').textContent = text;
 }
 function connect() {
   if (!apiKey) { setStatus('', 'Add your API key to start'); return; }
-  if (ws) { ws.onclose = null; ws.close(); }
-  clearTimeout(reconnectTimer);
-  subscribed.clear();
+  stopStream();
+  if (keyBad) { setStatus('err', 'API key rejected by Finnhub. Fix it under ⚙ > API key'); return; }
   setStatus('', 'Connecting…');
   ws = new WebSocket(`wss://ws.finnhub.io?token=${encodeURIComponent(apiKey)}`);
-  ws.onopen = () => { setStatus('on', 'Live'); resubscribe(); };
+  ws.onopen = () => { wsFails = 0; resubscribe(); };
   ws.onmessage = ev => {
     const msg = JSON.parse(ev.data);
     if (msg.type === 'trade' && msg.data) {
@@ -781,11 +833,21 @@ function connect() {
     } else if (msg.type === 'error') setStatus('err', msg.msg || 'Stream error');
   };
   ws.onerror = () => setStatus('err', 'Live stream blocked or key rejected');
-  ws.onclose = ev => { setStatus('err', `Stream closed (code ${ev.code}), retrying…`); reconnectTimer = setTimeout(connect, 5000); };
+  ws.onclose = ev => {
+    ws = null; subscribed.clear();
+    if (keyBad) { setStatus('err', 'API key rejected by Finnhub. Fix it under ⚙ > API key'); return; }
+    wsFails++;
+    if (wsFails >= WS_MAX_FAILS) { setStatus('err', 'Live stream unavailable. Prices refresh every minute instead'); return; }
+    const wait = Math.min(5000 * 2 ** (wsFails - 1), 120000);   // 5s, 10s, 20s… up to 2 min
+    setStatus('err', `Stream closed (code ${ev.code}), retrying in ${Math.round(wait / 1000)}s…`);
+    reconnectTimer = setTimeout(connect, wait);
+  };
 }
 function resubscribe() {
-  if (!ws || ws.readyState !== 1) return;
-  const want = new Set(liveSyms());
+  if (!streamLive()) return;
+  const all = liveSyms();
+  const want = new Set(all.slice(0, WS_MAX));   // priority: market boxes, current list, holdings, alerts
+  setStatus('on', all.length > WS_MAX ? `Live · ${WS_MAX} of ${all.length} streamed, others refresh every minute` : 'Live');
   for (const s of subscribed) if (!want.has(s)) { ws.send(JSON.stringify({ type: 'unsubscribe', symbol: s })); subscribed.delete(s); }
   for (const s of want) if (!subscribed.has(s)) { ws.send(JSON.stringify({ type: 'subscribe', symbol: s })); subscribed.add(s); }
 }
@@ -936,7 +998,7 @@ function buildMarkets() {
       <canvas width="150" height="24"></canvas>`;
     card.querySelector('.nm').textContent = m.name;
     card.querySelector('.note').textContent = m.note || m.sym;
-    card.title = m.sym;
+    card.title = PROXY_NOTE[m.sym] || m.sym;
     wrap.appendChild(card);
     mark(m.sym);
   });
@@ -1419,8 +1481,10 @@ function openHoldingForm(sym) {
 $('holdAdd').onclick = () => openHoldingForm('');
 $('hCancel').onclick = () => $('hform').classList.remove('show');
 $('hSave').onclick = () => {
-  const sym = $('hSym').value.trim().toUpperCase(), sh = parseFloat($('hShares').value), cost = parseFloat($('hCost').value);
-  if (!sym) { toast('Enter a ticker'); return; }
+  const raw = $('hSym').value.trim(), sym = cleanSym(raw.replace(/\s+/g, '.')), sh = parseFloat($('hShares').value), cost = parseFloat($('hCost').value);
+  if (!raw) { toast('Enter a ticker'); return; }
+  if (!sym) { toast('Tickers can only use letters, numbers and . - (e.g. BRK.B)'); return; }
+  if (isCrypto(sym)) { toast('Holdings track stocks and ETFs only'); return; }
   if (!isFinite(sh) || sh <= 0) { toast('Enter how many shares you own'); return; }
   if (!isFinite(cost) || cost < 0) { toast('Enter your average cost per share'); return; }
   holdings[sym] = { shares: sh, cost }; store.set('fh_holdings', holdings);
@@ -1449,31 +1513,43 @@ function renderHoldings() {
     const basis = h.shares * h.cost;
     return { s, h, d, val, day, dayBase: d.pc ? h.shares * d.pc : null, tot: val != null ? val - basis : null, basis };
   }).sort((a, b) => (b.val ?? 0) - (a.val ?? 0));
-  const tb = $('hrows'); tb.innerHTML = '';
-  for (const r of rows) {
-    const tr = document.createElement('tr');
-    const c0 = cell(tr, '<div class="symcell"><span class="lg"></span><div class="symtxt"><b></b><small></small></div></div>');
-    c0.querySelector('.lg').replaceWith(makeLogo(r.s));
-    c0.querySelector('b').textContent = r.s;
-    c0.querySelector('small').textContent = `${fmt(r.h.shares, r.h.shares % 1 ? 4 : 0)} sh @ $${fmt(r.h.cost)}`;
-    c0.querySelector('.symcell').style.cursor = 'default';
-    const vc = cell(tr, `<div><span class="hval">${money(r.val)}</span></div><div class="sub muted">$${fmt(r.d.price)}</div>`, 'num');
+  // Rows are built once per position and then updated in place, so the ✎ / ✕ buttons are never
+  // swapped out from under the mouse while prices tick. Only re-ordered when the order actually changes.
+  const tb = $('hrows');
+  const have = new Map([...tb.children].map(tr => [tr.dataset.hsym, tr]));
+  for (const [s, tr] of have) if (!holdings[s] || !(holdings[s].shares > 0)) { tr.remove(); have.delete(s); }
+  rows.forEach((r, i) => {
+    let tr = have.get(r.s);
+    if (!tr) {
+      tr = document.createElement('tr'); tr.dataset.hsym = r.s;
+      const c0 = cell(tr, '<div class="symcell"><span class="lg"></span><div class="symtxt"><b></b><small></small></div></div>');
+      c0.querySelector('.lg').replaceWith(makeLogo(r.s));
+      c0.querySelector('b').textContent = r.s;
+      c0.querySelector('.symcell').style.cursor = 'default';
+      cell(tr, '<div><span class="hval"></span></div><div class="sub muted hpx"></div>', 'num');
+      cell(tr, '', 'num hday'); cell(tr, '', 'num htot');
+      const a = cell(tr, '<button class="ib" title="Edit">✎</button><button class="ib x" title="Remove">✕</button>', 'acts');
+      a.children[0].onclick = () => openHoldingForm(r.s);
+      a.children[1].onclick = () => {
+        if (!confirm(`Remove your ${r.s} position?`)) return;
+        delete holdings[r.s]; delete prevHold[r.s]; store.set('fh_holdings', holdings); holdingsDirty = true; renderHoldings(); resubscribe();
+      };
+    }
+    if (tb.children[i] !== tr) tb.insertBefore(tr, tb.children[i] || null);
+    tr.querySelector('small').textContent = `${fmt(r.h.shares, r.h.shares % 1 ? 4 : 0)} sh @ $${fmt(r.h.cost)}`;
+    const hv = tr.querySelector('.hval'); hv.textContent = money(r.val);
+    tr.querySelector('.hpx').textContent = '$' + fmt(r.d.price);
     const pv = prevHold[r.s];
     if (pv != null && r.val != null && r.val !== pv) {   // flash when the value moves
-      const el = vc.querySelector('.hval'); el.classList.add(r.val > pv ? 'flash-up' : 'flash-down');
-      setTimeout(() => el.classList.remove('flash-up', 'flash-down'), 150);
+      hv.classList.add(r.val > pv ? 'flash-up' : 'flash-down');
+      setTimeout(() => hv.classList.remove('flash-up', 'flash-down'), 150);
     }
     prevHold[r.s] = r.val;
-    cell(tr, gainHTML(r.day, r.dayBase), 'num');
-    cell(tr, gainHTML(r.tot, r.basis), 'num');
-    const a = cell(tr, '<button class="ib" title="Edit">✎</button><button class="ib x" title="Remove">✕</button>', 'acts');
-    a.children[0].onclick = () => openHoldingForm(r.s);
-    a.children[1].onclick = () => {
-      if (!confirm(`Remove your ${r.s} position?`)) return;
-      delete holdings[r.s]; store.set('fh_holdings', holdings); holdingsDirty = true; renderHoldings(); resubscribe();
-    };
-    tb.appendChild(tr);
-  }
+    const dh = gainHTML(r.day, r.dayBase), th = gainHTML(r.tot, r.basis);
+    const dc = tr.querySelector('.hday'), tc = tr.querySelector('.htot');
+    if (dc._h !== dh) { dc.innerHTML = dh; dc._h = dh; }
+    if (tc._h !== th) { tc.innerHTML = th; tc._h = th; }
+  });
   renderAlloc(rows);
   const foot = $('hfoot'); foot.innerHTML = '';
   if (rows.length) {
@@ -1673,12 +1749,15 @@ async function manualRefresh(btn, syms) {
 $('marketsRefresh').onclick = e => manualRefresh(e.currentTarget, markets.map(m => m.sym));
 $('watchRefresh').onclick = e => manualRefresh(e.currentTarget, [...W()]);
 
-$('exportBtn').onclick = () => {
+function downloadExport(filename) {
   const out = { app: 'live-stock-dashboard', version: 2, exported: new Date().toISOString(), lists, activeId, holdings, alerts, markets, notes, tvChannels };
   const blob = new Blob([JSON.stringify(out, null, 2)], { type: 'application/json' });
-  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'dashboard.json';
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = filename;
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+$('exportBtn').onclick = () => {
+  downloadExport('dashboard.json');
   toast('Exported your lists, holdings, alerts, notes and market boxes');
 };
 $('importBtn').onclick = () => $('importFile').click();
@@ -1689,6 +1768,12 @@ $('importFile').onchange = async e => {
     const j = JSON.parse(await f.text());
     const L = cleanLists(j && j.lists);
     if (L) {   // everything is checked before it's saved; anything malformed is dropped
+      const nH = Object.keys(cleanHoldings(j.holdings)).length, nS = L.reduce((t, l) => t + l.symbols.length, 0);
+      const ok = confirm(`Replace your current dashboard with this file?\n\nIt has ${L.length} list${L.length === 1 ? '' : 's'} (${nS} stocks) and ${nH} holding${nH === 1 ? '' : 's'}. ` +
+        `Your current lists, holdings, alerts, notes and market boxes will be replaced.\n\nA backup of your current data will be downloaded first.`);
+      if (!ok) return;
+      downloadExport(`dashboard-backup-${new Date().toISOString().slice(0, 19).replace(/[T:]/g, '-')}.json`);
+      await sleep(400);   // let the backup download start before the page reloads
       store.set('fh_lists', L);
       store.set('fh_active', L.some(l => l.id === j.activeId) ? j.activeId : L[0].id);
       if (j.holdings) store.set('fh_holdings', cleanHoldings(j.holdings));
@@ -1711,25 +1796,76 @@ $('keyBtn').onclick = openKey;
 $('keyCancel').onclick = () => $('keyModal').classList.remove('show');
 $('keySave').onclick = () => {
   apiKey = $('keyInput').value.trim(); store.set('fh_key', apiKey);
+  keyBad = false; wsFails = 0;
   $('keyModal').classList.remove('show');
   startFinnhub();
 };
 $('keyInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('keySave').click(); });
 
+// ---- NYSE calendar: full holidays and 1 PM early closes, computed for any year ----
+const _hol = {};
+function nyseCalendar(y) {
+  if (_hol[y]) return _hol[y];
+  const key = (m, d) => `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+  const dow = (m, d) => new Date(Date.UTC(y, m - 1, d)).getUTCDay();
+  const nth = (m, wd, n) => { let d = 1; while (dow(m, d) !== wd) d++; return d + (n - 1) * 7; };
+  const last = (m, wd) => { let d = new Date(Date.UTC(y, m, 0)).getUTCDate(); while (dow(m, d) !== wd) d--; return d; };
+  const observed = (m, d) => {   // Saturday -> Friday, Sunday -> Monday
+    const w = dow(m, d), t = new Date(Date.UTC(y, m - 1, d + (w === 6 ? -1 : w === 0 ? 1 : 0)));
+    return t.toISOString().slice(0, 10);
+  };
+  // Easter (anonymous Gregorian algorithm) -> Good Friday
+  const a = y % 19, b = Math.floor(y / 100), c = y % 100, d = Math.floor(b / 4), e = b % 4, f = Math.floor((b + 8) / 25),
+        g = Math.floor((b - f + 1) / 3), h = (19 * a + b - d - g + 15) % 30, i = Math.floor(c / 4), k = c % 4,
+        l = (32 + 2 * e + 2 * i - h - k) % 7, m = Math.floor((a + 11 * h + 22 * l) / 451),
+        em = Math.floor((h + l - 7 * m + 114) / 31), ed = ((h + l - 7 * m + 114) % 31) + 1;
+  const gf = new Date(Date.UTC(y, em - 1, ed - 2)).toISOString().slice(0, 10);
+  const closed = new Set([
+    dow(1, 1) === 6 ? null : observed(1, 1),   // New Year's (not moved back into December)
+    key(1, nth(1, 1, 3)), key(2, nth(2, 1, 3)), gf, key(5, last(5, 1)),
+    y >= 2022 ? observed(6, 19) : null, observed(7, 4), key(9, nth(9, 1, 1)),
+    key(11, nth(11, 4, 4)), observed(12, 25),
+  ].filter(Boolean));
+  const tg = nth(11, 4, 4);
+  const early = new Set([key(11, tg + 1), key(7, 3), key(12, 24)]
+    .filter(s => { const w = new Date(s + 'T12:00:00Z').getUTCDay(); return w > 0 && w < 6 && !closed.has(s); }));
+  return (_hol[y] = { closed, early });
+}
+// trading hours (minutes after midnight ET) for a YYYY-MM-DD date, or null if the market is closed all day
+function sessionFor(ds) {
+  const w = new Date(ds + 'T12:00:00Z').getUTCDay();
+  if (w === 0 || w === 6) return null;
+  const cal = nyseCalendar(+ds.slice(0, 4));
+  if (cal.closed.has(ds)) return null;
+  return { open: 570, close: cal.early.has(ds) ? 780 : 960 };
+}
 function marketHint() {
   const ny = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
-  const mins = ny.getHours() * 60 + ny.getMinutes(), day = ny.getDay();
-  const wk = d => d > 0 && d < 6;
+  const mins = ny.getHours() * 60 + ny.getMinutes();
+  const dstr = dt => `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}-${String(dt.getDate()).padStart(2, '0')}`;
   const dur = m => m >= 1440 ? `${Math.floor(m / 1440)}d ${Math.floor(m % 1440 / 60)}h` : m >= 60 ? `${Math.floor(m / 60)}h ${m % 60}m` : `${m}m`;
   const el = $('market');
-  if (wk(day) && mins >= 570 && mins < 960) { el.textContent = `Market open · closes in ${dur(960 - mins)}`; el.style.color = 'var(--up)'; }
-  else {
-    let add, d = day;
-    if (wk(d) && mins < 570) add = 570 - mins;
-    else { add = 1440 - mins; d = (d + 1) % 7; while (!wk(d)) { add += 1440; d = (d + 1) % 7; } add += 570; }
-    el.textContent = `Market closed · opens in ${dur(add)}`; el.style.color = '';
+  const today = sessionFor(dstr(ny));
+  if (today && mins >= today.open && mins < today.close) {
+    el.textContent = `Market open · closes in ${dur(today.close - mins)}${today.close < 960 ? ' (early close)' : ''}`;
+    el.style.color = 'var(--up)';
+  } else {
+    let add, why = '';
+    if (today && mins < today.open) add = today.open - mins;
+    else {
+      if (!today && ny.getDay() > 0 && ny.getDay() < 6) why = ' (holiday)';
+      add = 1440 - mins;
+      const dt = new Date(ny); dt.setHours(12, 0, 0, 0);
+      for (let n = 0; n < 10; n++) {
+        dt.setDate(dt.getDate() + 1);
+        const s = sessionFor(dstr(dt));
+        if (s) { add += s.open; break; }
+        add += 1440;
+      }
+    }
+    el.textContent = `Market closed${why} · opens in ${dur(add)}`; el.style.color = '';
   }
-  el.title = 'Regular hours 9:30 AM – 4:00 PM ET. Market holidays are not accounted for.';
+  el.title = 'Regular hours 9:30 AM – 4:00 PM ET, 1:00 PM on early-close days. NYSE holidays included; rare one-off closures are not.';
 }
 setInterval(marketHint, 20000); marketHint();
 
@@ -1761,7 +1897,7 @@ function applyCols() {
   const l = document.createElement('label'); const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = cols.tint;
   cb.onchange = () => { cols.tint = cb.checked; store.set('fh_cols', cols); markAll(); };
   l.append(cb, "Color rows by today's move"); m.appendChild(l);
-  $('colsBtn').onclick = e => { e.stopPropagation(); closeMenus('colsMenu'); m.classList.toggle('show'); };
+  $('colsBtn').onclick = e => { e.stopPropagation(); toggleMenu(m, e.currentTarget); };
   ['1D', '5D', 'MTD', '3M', '6M', 'YTD', '1Y'].forEach(pk => {
     const b = document.createElement('button'); b.textContent = pk; b.dataset.p = pk;
     b.title = pk === '1D' ? 'Today (live)' : { '5D': 'Last 5 days', MTD: 'Month to date', '3M': 'Last 3 months', '6M': 'Last 6 months', YTD: 'Year to date', '1Y': 'Last 12 months' }[pk] + ' (as of last close)';
@@ -1774,6 +1910,29 @@ function applyCols() {
 function buildColsSync() { const boxes = $('colsMenu').querySelectorAll('input'); COLS.forEach((c, i) => { boxes[i].checked = cols[c.k]; }); }
 function closeMenus(except) { document.querySelectorAll('.menu.show').forEach(m => { if (m.id !== except) m.classList.remove('show'); }); }
 document.addEventListener('click', e => { if (!e.target.closest('.menuwrap')) closeMenus(); });
+// Open a dropdown under its button, kept fully on screen (fixes menus opening off the left edge on phones)
+function placeMenu(m, btn) {
+  m.classList.add('placed');
+  const r = btn.getBoundingClientRect(), vw = document.documentElement.clientWidth;
+  const w = Math.min(m.offsetWidth || 260, vw - 16);
+  let left = r.right - w;                     // right-align with the button by default
+  if (left < 8) left = r.left;                // not enough room: left-align instead
+  left = Math.max(8, Math.min(left, vw - w - 8));
+  m.style.left = left + 'px'; m.style.top = (r.bottom + 6) + 'px';
+}
+function toggleMenu(m, btn) {
+  const open = !m.classList.contains('show');
+  closeMenus(m.id);
+  m.classList.toggle('show', open);
+  if (open) placeMenu(m, btn);
+}
+const repositionMenus = () => document.querySelectorAll('.menu.show').forEach(m => {
+  const btn = m.parentElement.querySelector('button'); if (btn) placeMenu(m, btn);
+});
+window.addEventListener('resize', repositionMenus);
+window.addEventListener('scroll', repositionMenus, { passive: true });
+$('gearBtn').onclick = e => { e.stopPropagation(); toggleMenu($('gearMenu'), e.currentTarget); };
+$('gearMenu').addEventListener('click', e => { if (e.target.closest('a')) closeMenus(); });
 
 // ---------- scanner (ranks stocks across your lists) ----------
 const chgToday = s => { const d = data[s]; return d && d.price != null && d.pc ? d.price - d.pc : null; };
@@ -1844,13 +2003,13 @@ function scanJump(sym) {
     l.append(cb, sc.name); m.appendChild(l);
   });
   m.insertAdjacentHTML('beforeend', '<hr><p>Scans the stocks in your lists and holdings. Finnhub\'s free plan has no whole-market movers list.</p>');
-  $('scanBtn').onclick = e => { e.stopPropagation(); closeMenus('scanMenu'); m.classList.toggle('show'); };
+  $('scanBtn').onclick = e => { e.stopPropagation(); toggleMenu(m, e.currentTarget); };
   $('scanUniverse').value = scanUni;
   $('scanUniverse').onchange = e => { scanUni = e.target.value; store.set('fh_scan_uni', scanUni); loadScanData(); renderScanner(); };
 })();
 // stocks in your other lists aren't streamed live, so check them every 2 minutes for the scanner
 function loadScanData() {
-  if (!apiKey || isCollapsed('secScanner')) return;
+  if (!apiKey || keyBad || backlogged() || isCollapsed('secScanner')) return;
   const live = new Set(liveSyms());
   scanUniverse().forEach(s => { ensure(s); loadMetrics(s); if (!live.has(s)) loadQuote(s, true); });
 }
@@ -2006,7 +2165,7 @@ function syncSecMenu() {
     l.append(cb, label); m.appendChild(l);
   });
   m.insertAdjacentHTML('beforeend', '<hr><p>Hidden sections stay as a slim title bar; click it to open again. Hidden Scanner and Top Stories stop loading data.</p>');
-  $('secBtn').onclick = e => { e.stopPropagation(); closeMenus('secMenu'); m.classList.toggle('show'); };
+  $('secBtn').onclick = e => { e.stopPropagation(); toggleMenu(m, e.currentTarget); };
   SECTIONS.slice(1).forEach(([id]) => {
     const sec = $(id), h2 = sec.querySelector('h2');
     sec.querySelector('.coll').onclick = e => { e.stopPropagation(); setCollapsed(id, !isCollapsed(id)); };
@@ -2031,16 +2190,39 @@ function startFinnhub() {
   scheduleNews(800);
   setTimeout(loadScanData, 4000);
 }
-// day stats every 60s, stories every 10 min, quiet market boxes every 15s
-setInterval(() => { if (apiKey) liveSyms().forEach(s => loadQuote(s)); }, 60000);
-setInterval(() => { if (apiKey) loadNews(); }, 10 * 60000);
+// Every minute: refresh the price of anything that isn't getting live trades (stream down, not streamed
+// because of the 50-symbol cap, or just quiet). Streamed symbols only get their day stats every 5 min.
+// Skipped while a backlog is queued so big lists don't pile up requests under the free 60/min limit.
+let statTick = 0;
+const backlogged = () => queue.length > 25;
 setInterval(() => {
-  if (!apiKey) return;
+  if (!apiKey || keyBad || backlogged()) return;
+  const full = statTick++ % 5 === 0;
+  liveSyms().forEach(s => {
+    const d = data[s], streamed = streamLive() && subscribed.has(s);
+    const stale = !streamed || !d || !d.last || Date.now() - d.last > 90000;
+    if (stale) loadQuote(s, true); else if (full) loadQuote(s);
+  });
+}, 60000);
+setInterval(() => { if (apiKey && !keyBad && !backlogged()) loadNews(); }, 10 * 60000);
+setInterval(() => {
+  if (!apiKey || keyBad || backlogged()) return;
   markets.filter(m => !m.crypto).forEach(m => {
     const d = data[m.sym];
     if (!d || !d.last || Date.now() - d.last > 30000) loadQuote(m.sym, true);
   });
 }, 30000);
+
+// tidy old cached company data: daily caches from earlier days, and logos/names for symbols you no longer follow
+(() => {
+  const inUse = new Set([...lists.flatMap(l => l.symbols), ...Object.keys(holdings), ...markets.map(m => m.sym), ...alerts.map(a => a.sym)]);
+  const today = nyDate();
+  pruneCaches((k, v) => {
+    const sym = k.replace(CACHE_RE, '');
+    if (k.startsWith('fh_prof_')) return !inUse.has(sym);
+    return !v || v.day !== today;
+  });
+})();
 
 buildMarkets();
 renderTabs();
